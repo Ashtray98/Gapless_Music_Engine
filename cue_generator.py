@@ -24,6 +24,31 @@ class CueSheetGenerator:
         self.sample_rate = sample_rate
         self.tracks: List[TrackContext] = []
 
+    def generate_single_file_cue(self) -> str:
+        """Compiles a Red Book CUE string for a single merged master file."""
+        if not self.tracks:
+            raise CueGenerationError("No tracks provided.")
+            
+        # The master file name is stored in the first track's context
+        master_file = self.tracks[0].file_path
+            
+        lines = [
+            f'PERFORMER "{self.album_performer}"',
+            f'TITLE "{self.album_title}"',
+            f'FILE "{master_file}" WAVE'
+        ]
+        
+        for track in sorted(self.tracks, key=lambda t: t.track_num):
+            timecode = self._samples_to_timecode(track.start_sample)
+            lines.extend([
+                f'  TRACK {track.track_num:02d} AUDIO',
+                f'    TITLE "{track.title}"',
+                f'    PERFORMER "{track.performer}"',
+                f'    INDEX 01 {timecode}'
+            ])
+            
+        return "\n".join(lines) + "\n"
+
     def _samples_to_timecode(self, samples: int) -> str:
         """
         Converts absolute sample index to CD-DA mm:ss:ff format.

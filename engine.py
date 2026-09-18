@@ -25,6 +25,22 @@ class EngineConfig:
 
 
 class GaplessAudioEngine:
+
+    def load_audio(self, file_path: str) -> npt.NDArray[np.float32]:
+        """
+        Loads audio, forces stereo, and resamples to target CD spec (44100Hz) 
+        using high-quality anti-aliasing filters.
+        """
+        # librosa.load automatically handles downmixing to mono/stereo 
+        # and resamples cleanly if target_sr is provided.
+        audio, _ = librosa.load(
+            file_path, 
+            sr=self.config.sample_rate,  # Set this to 44100 in your config
+            mono=False                   # Preserves stereo channels (2 x N matrix)
+        )
+        return audio
+
+    
     def __init__(self, config: EngineConfig = EngineConfig()):
         self.config = config
 
@@ -38,24 +54,35 @@ class GaplessAudioEngine:
             raise AudioProcessingError(f"Ingestion failed: {e}")
 
     def denoise_svd(self, audio: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
-        """Applies Truncated SVD to isolate structural signal from stochastic noise."""
+        """Applies Truncated SVD with Reflection Padding to prevent boundary artifacts."""
         mono = librosa.to_mono(audio) if audio.ndim > 1 else audio
         
+        # 1. Pad the edges to give the ISTFT windowing room to calculate
+        pad_size = self.config.n_fft
+        padded_mono = np.pad(mono, pad_size, mode='reflect')
+        
+        # 2. Run STFT on the padded audio
         stft_matrix = librosa.stft(
-            mono, 
+            padded_mono, 
             n_fft=self.config.n_fft, 
             hop_length=self.config.hop_length
         )
         
+        # 3. SVD Filtering
         U, Sigma, Vt = np.linalg.svd(stft_matrix, full_matrices=False)
-        
         Sigma_filtered = np.zeros_like(Sigma)
         Sigma_filtered[:self.config.svd_rank_k] = Sigma[:self.config.svd_rank_k]
         
         stft_clean = U @ np.diag(Sigma_filtered) @ Vt
         
-        return librosa.istft(stft_clean, hop_length=self.config.hop_length)
-
+        # 4. Reconstruct the padded audio
+        clean_padded = librosa.istft(stft_clean, hop_length=self.config.hop_length)
+        
+        # 5. Crop the padding off to return to exact original dimensions
+        # This leaves the true edges at 100% original energy
+        clean_audio = clean_padded[pad_size : pad_size + mono.shape[-1]]
+        
+        return clean_audio
     def detect_boundaries(self, audio: npt.NDArray[np.float32]) -> Tuple[int, int]:
         """Calculates gapless start and end sample indices using RMS thresholding."""
         rms = librosa.feature.rms(
@@ -70,17 +97,24 @@ class GaplessAudioEngine:
         if active_frames.size == 0:
             raise AudioProcessingError("Signal is entirely below noise threshold.")
             
-        start_sample = librosa.frames_to_samples(
-            active_frames[0], 
-            hop_length=self.config.hop_length
-        )
-        end_sample = librosa.frames_to_samples(
-            active_frames[-1], 
-            hop_length=self.config.hop_length
-        )
+        start_sample = librosa.frames_to_samples(active_frames[0], hop_length=self.config.hop_length)
+        end_sample = librosa.frames_to_samples(active_frames[-1], hop_length=self.config.hop_length)
         
-        pre_roll_samples = math.floor((self.config.pre_roll_ms / 1000.0) * self.config.sample_rate)
-        final_start = max(0, start_sample - pre_roll_samples)
+        total_samples = audio.shape[-1]
+        
+        # --- NEW GAPLESS PROTECTION LOGIC ---
+        # 50ms tolerance window to detect contiguous track bleeds
+        edge_tolerance = math.floor(0.050 * self.config.sample_rate) 
+        
+        if start_sample < edge_tolerance:
+            final_start = 0  # Clamp to absolute start, do not apply pre-roll
+        else:
+            pre_roll_samples = math.floor((self.config.pre_roll_ms / 1000.0) * self.config.sample_rate)
+            final_start = max(0, start_sample - pre_roll_samples)
+            
+        if (total_samples - end_sample) < edge_tolerance:
+            end_sample = total_samples  # Clamp to absolute end
+        # ------------------------------------
         
         return final_start, end_sample
 
